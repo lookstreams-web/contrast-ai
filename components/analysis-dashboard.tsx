@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
   Anchor,
   Badge,
+  Button,
   Divider,
   Group,
   List,
@@ -122,6 +123,22 @@ const pending = new Set([
   "scoring",
   "synthesizing"
 ]);
+
+/**
+ * El análisis tarda minutos y avanza por etapas: preguntar cada 2 s todo el
+ * tiempo repite la misma respuesta y multiplica las ocasiones de fallar. El
+ * ritmo se relaja a medida que la espera se alarga.
+ */
+function pollDelay(elapsedMs: number): number {
+  if (elapsedMs < 20_000) return 2_000;
+  if (elapsedMs < 120_000) return 5_000;
+  return 10_000;
+}
+
+// Un corte de red o un redespliegue no significan que el análisis muriera: el
+// worker sigue trabajando. Reintentamos separando cada vez más los intentos.
+const RETRY_DELAYS_MS = [3_000, 5_000, 8_000, 12_000, 15_000];
+const MAX_CONSECUTIVE_FAILURES = 5;
 
 const levelColors: Record<string, string> = {
   bajo: "green",
@@ -316,48 +333,145 @@ function InsightCard({
 
 export function AnalysisDashboard({ id, dict, locale }: { id: string; dict: DashboardDict; locale: string }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [networkError, setNetworkError] = useState<string | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  // `connection` distingue "no llegamos al servidor" (el análisis sigue vivo)
+  // de una respuesta explícita como 404, donde no hay nada que esperar.
+  const [failure, setFailure] = useState<{ message: string; connection: boolean } | null>(null);
+  const [retryToken, setRetryToken] = useState(0);
+
+  // El diccionario cambia de identidad en cada render del padre; guardarlo en
+  // una ref evita reiniciar el polling por ese motivo.
+  const dictRef = useRef(dict);
+  dictRef.current = dict;
+
+  const retryNow = useCallback(() => {
+    setFailure(null);
+    setReconnecting(false);
+    setRetryToken((token) => token + 1);
+  }, []);
 
   useEffect(() => {
     let active = true;
+    let done = false;
+    let failures = 0;
+    // Evita cadenas de polling duplicadas: `wakeUp` puede disparar mientras
+    // una petición sigue en vuelo, y esa ya reagenda la siguiente al terminar.
+    let inFlight = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const startedAt = Date.now();
+
+    function schedule(delayMs: number) {
+      if (!active || done) return;
+      timer = setTimeout(load, delayMs);
+    }
+
+    function stop(message: string, connection: boolean) {
+      done = true;
+      setFailure({ message, connection });
+    }
 
     async function load() {
+      if (!active || done || inFlight) return;
+      inFlight = true;
       try {
         const response = await fetch(`/api/analyses/${id}`, { cache: "no-store" });
         const body = await response.json();
-        if (!response.ok) throw new Error(body.error?.message ?? dict.queryError);
         if (!active) return;
-        setSnapshot(body);
-        setNetworkError(null);
-        if (pending.has(body.status)) timer = setTimeout(load, 2000);
-      } catch (caught) {
-        if (active) {
-          setNetworkError(caught instanceof Error ? caught.message : dict.queryError);
+
+        if (!response.ok) {
+          const message = body.error?.message ?? dictRef.current.queryError;
+          // Un 404 o un id inválido no se arreglan reintentando.
+          if (response.status >= 400 && response.status < 500) return stop(message, false);
+          throw new Error(message);
         }
+
+        failures = 0;
+        setSnapshot(body);
+        setReconnecting(false);
+        setFailure(null);
+        if (pending.has(body.status)) schedule(pollDelay(Date.now() - startedAt));
+        else done = true;
+      } catch (caught) {
+        if (!active) return;
+        failures += 1;
+        if (failures >= MAX_CONSECUTIVE_FAILURES) {
+          // TypeError (red caída) y SyntaxError (respuesta no-JSON de un
+          // intermediario) traen textos técnicos en inglés; mostramos el nuestro.
+          const technical = caught instanceof TypeError || caught instanceof SyntaxError;
+          const message =
+            !technical && caught instanceof Error ? caught.message : dictRef.current.queryError;
+          return stop(message, true);
+        }
+        setReconnecting(true);
+        schedule(RETRY_DELAYS_MS[Math.min(failures - 1, RETRY_DELAYS_MS.length - 1)]);
+      } finally {
+        inFlight = false;
       }
     }
 
+    // Al recuperar la red o volver a la pestaña, no esperamos al temporizador.
+    function wakeUp() {
+      if (!active || done) return;
+      if (timer) clearTimeout(timer);
+      void load();
+    }
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") wakeUp();
+    }
+
     void load();
+    window.addEventListener("online", wakeUp);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
     return () => {
       active = false;
       if (timer) clearTimeout(timer);
+      window.removeEventListener("online", wakeUp);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [id, dict]);
+  }, [id, retryToken]);
 
-  if (networkError) {
+  // Solo bloqueamos la pantalla si no hay nada que mostrar; con datos previos
+  // seguimos mostrando el progreso y el aviso viaja como banda superior.
+  if (failure && !snapshot) {
     return (
       <Alert color="red" title={dict.loadErrorTitle}>
-        {networkError}
+        <Stack align="flex-start" gap="sm">
+          <Text size="sm">{failure.message}</Text>
+          {failure.connection ? (
+            <Text c="dimmed" size="sm">
+              {dict.stillRunningNote}
+            </Text>
+          ) : null}
+          <Button color="red" onClick={retryNow} size="xs" variant="light">
+            {dict.retry}
+          </Button>
+        </Stack>
       </Alert>
     );
   }
+
+  const connectionNotice = failure ? (
+    <Alert color="red" title={dict.loadErrorTitle}>
+      <Group align="center" gap="sm" justify="space-between">
+        <Text size="sm">{failure.message}</Text>
+        <Button color="red" onClick={retryNow} size="xs" variant="light">
+          {dict.retry}
+        </Button>
+      </Group>
+    </Alert>
+  ) : reconnecting ? (
+    <Alert color="yellow" variant="light">
+      {dict.reconnecting}
+    </Alert>
+  ) : null;
 
   if (!snapshot) {
     return (
       <>
         <ScanPulses />
         <Stack gap="lg">
+          {connectionNotice}
           <div>
             <Skeleton height={10} width={96} />
             <Skeleton height={22} mt={10} width="45%" />
@@ -388,6 +502,7 @@ export function AnalysisDashboard({ id, dict, locale }: { id: string; dict: Dash
         <ScanPulses />
         <Stack gap="lg">
           <SourceInfo dict={dict} locale={locale} source={snapshot.source} />
+          {connectionNotice}
           <Paper withBorder p="xl" radius="lg">
             <Stack gap="md">
               <Group justify="space-between">
